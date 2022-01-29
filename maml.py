@@ -8,10 +8,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch import autograd  # pylint: disable=unused-import
-from torch.utils import tensorboard
+#from torch.utils import tensorboard
 
 import omniglot
 import util  # pylint: disable=unused-import
+import neptune.new as neptune
+from tqdm import tqdm
 
 NUM_INPUT_CHANNELS = 1
 NUM_HIDDEN_CHANNELS = 64
@@ -35,7 +37,9 @@ class MAML:
             inner_lr,
             learn_inner_lrs,
             outer_lr,
-            log_dir
+            log_dir,
+            tensorboard_writer=None,
+            neptune_run=None
     ):
         """Inits MAML.
 
@@ -118,6 +122,9 @@ class MAML:
 
         self._start_train_step = 0
 
+        self.tensorboard_writer = tensorboard_writer
+        self.neptune_run = neptune_run
+
     def _forward(self, images, parameters):
         """Computes predicted classification logits.
 
@@ -138,7 +145,7 @@ class MAML:
                 weight=parameters[f'conv{i}'],
                 bias=parameters[f'b{i}'],
                 stride=1,
-                padding='same'
+                padding=1
             )
             x = F.batch_norm(x, None, None, training=True)
             x = F.relu(x)
@@ -169,19 +176,17 @@ class MAML:
             k: torch.clone(v)
             for k, v in self._meta_parameters.items()
         }
-        # ********************************************************
-        # ******************* YOUR CODE HERE *********************
-        # ********************************************************
-        # TODO: finish implementing this method.
-        # This method computes the inner loop (adaptation) procedure for one
-        # task. It also scores the model along the way.
-        # Make sure to populate accuracies and update parameters.
-        # Use F.cross_entropy to compute classification losses.
-        # Use util.score to compute accuracies.
+        for _ in range(self._num_inner_steps):
+            pred = self._forward(images, parameters)
+            loss = F.cross_entropy(pred,labels)
+            accuracies.append(util.score(pred.detach(),labels))
 
-        # ********************************************************
-        # ******************* YOUR CODE HERE *********************
-        # ********************************************************
+            for k,v in parameters.items():
+                grad = torch.autograd.grad(loss, v, create_graph=True)[0]
+                parameters[k] = v - self._inner_lrs[k]*grad
+
+        pred = self._forward(images, parameters)
+        accuracies.append(util.score(pred.detach(),labels))
         return parameters, accuracies
 
     def _outer_step(self, task_batch, train):  # pylint: disable=unused-argument
@@ -208,20 +213,16 @@ class MAML:
             labels_support = labels_support.to(DEVICE)
             images_query = images_query.to(DEVICE)
             labels_query = labels_query.to(DEVICE)
-            # ********************************************************
-            # ******************* YOUR CODE HERE *********************
-            # ********************************************************
-            # TODO: finish implementing this method.
-            # For a given task, use the _inner_loop method to adapt, then
-            # compute the MAML loss and other metrics.
-            # Use F.cross_entropy to compute classification losses.
-            # Use util.score to compute accuracies.
-            # Make sure to populate outer_loss_batch, accuracies_support_batch,
-            # and accuracy_query_batch.
+            
+            adapted_params, adapting_accuracies = self._inner_loop(images_support, labels_support, train=train)
+            pred = self._forward(images_query, adapted_params)
+            loss = F.cross_entropy(pred, labels_query)
+            query_acc = util.score(pred.detach(), labels_query)
 
-            # ********************************************************
-            # ******************* YOUR CODE HERE *********************
-            # ********************************************************
+            outer_loss_batch.append(loss)
+            accuracies_support_batch.append(adapting_accuracies)
+            accuracy_query_batch.append(query_acc)
+
         outer_loss = torch.mean(torch.stack(outer_loss_batch))
         accuracies_support = np.mean(
             accuracies_support_batch,
@@ -230,7 +231,7 @@ class MAML:
         accuracy_query = np.mean(accuracy_query_batch)
         return outer_loss, accuracies_support, accuracy_query
 
-    def train(self, dataloader_train, dataloader_val, writer):
+    def train(self, dataloader_train, dataloader_val):
         """Train the MAML.
 
         Consumes dataloader_train to optimize MAML meta-parameters
@@ -240,13 +241,12 @@ class MAML:
         Args:
             dataloader_train (DataLoader): loader for train tasks
             dataloader_val (DataLoader): loader for validation tasks
-            writer (SummaryWriter): TensorBoard logger
         """
         print(f'Starting training at iteration {self._start_train_step}.')
-        for i_step, task_batch in enumerate(
+        for i_step, task_batch in tqdm(enumerate(
                 dataloader_train,
                 start=self._start_train_step
-        ):
+        ),position=0,leave=True):
             self._optimizer.zero_grad()
             outer_loss, accuracies_support, accuracy_query = (
                 self._outer_step(task_batch, train=True)
@@ -255,32 +255,28 @@ class MAML:
             self._optimizer.step()
 
             if i_step % LOG_INTERVAL == 0:
-                print(
-                    f'Iteration {i_step}: '
-                    f'loss: {outer_loss.item():.3f}, '
-                    f'pre-adaptation support accuracy: '
-                    f'{accuracies_support[0]:.3f}, '
-                    f'post-adaptation support accuracy: '
-                    f'{accuracies_support[-1]:.3f}, '
-                    f'post-adaptation query accuracy: '
-                    f'{accuracy_query:.3f}'
-                )
-                writer.add_scalar('loss/train', outer_loss.item(), i_step)
-                writer.add_scalar(
-                    'train_accuracy/pre_adapt_support',
-                    accuracies_support[0],
-                    i_step
-                )
-                writer.add_scalar(
-                    'train_accuracy/post_adapt_support',
-                    accuracies_support[-1],
-                    i_step
-                )
-                writer.add_scalar(
-                    'train_accuracy/post_adapt_query',
-                    accuracy_query,
-                    i_step
-                )
+                if self.tensorboard_writer:
+                    self.tensorboard_writer.add_scalar('loss/train', outer_loss.item(), i_step)
+                    self.tensorboard_writer.add_scalar(
+                        'train_accuracy/pre_adapt_support',
+                        accuracies_support[0],
+                        i_step
+                    )
+                    self.tensorboard_writer.add_scalar(
+                        'train_accuracy/post_adapt_support',
+                        accuracies_support[-1],
+                        i_step
+                    )
+                    self.tensorboard_writer.add_scalar(
+                        'train_accuracy/post_adapt_query',
+                        accuracy_query,
+                        i_step
+                    )
+                if self.neptune_run:
+                    self.neptune_run['train/outer_loss'].log(outer_loss.item(), step=i_step)
+                    self.neptune_run['train/support_pre_adapt_acc'].log(accuracies_support[0].item(), step=i_step)
+                    self.neptune_run['train/support_post_adapt_acc'].log(accuracies_support[-1].item(), step=i_step)
+                    self.neptune_run['train/query_post_adapt_acc'].log(accuracy_query.item(), step=i_step)
 
             if i_step % VAL_INTERVAL == 0:
                 losses = []
@@ -305,32 +301,29 @@ class MAML:
                 accuracy_post_adapt_query = np.mean(
                     accuracies_post_adapt_query
                 )
-                print(
-                    f'Validation: '
-                    f'loss: {loss:.3f}, '
-                    f'pre-adaptation support accuracy: '
-                    f'{accuracy_pre_adapt_support:.3f}, '
-                    f'post-adaptation support accuracy: '
-                    f'{accuracy_post_adapt_support:.3f}, '
-                    f'post-adaptation query accuracy: '
-                    f'{accuracy_post_adapt_query:.3f}'
-                )
-                writer.add_scalar('loss/val', loss, i_step)
-                writer.add_scalar(
-                    'val_accuracy/pre_adapt_support',
-                    accuracy_pre_adapt_support,
-                    i_step
-                )
-                writer.add_scalar(
-                    'val_accuracy/post_adapt_support',
-                    accuracy_post_adapt_support,
-                    i_step
-                )
-                writer.add_scalar(
-                    'val_accuracy/post_adapt_query',
-                    accuracy_post_adapt_query,
-                    i_step
-                )
+                if self.tensorboard_writer:
+                    self.tensorboard_writer.add_scalar('loss/val', loss, i_step)
+                    self.tensorboard_writer.add_scalar(
+                        'val_accuracy/pre_adapt_support',
+                        accuracy_pre_adapt_support,
+                        i_step
+                    )
+                    self.tensorboard_writer.add_scalar(
+                        'val_accuracy/post_adapt_support',
+                        accuracy_post_adapt_support,
+                        i_step
+                    )
+                    self.tensorboard_writer.add_scalar(
+                        'val_accuracy/post_adapt_query',
+                        accuracy_post_adapt_query,
+                        i_step
+                    )
+                if self.neptune_run:
+                    self.neptune_run['val/loss'].log(loss.item(),step=i_step)
+                    self.neptune_run['val/support_pre_adapt_acc'].log(accuracy_pre_adapt_support.item(),step=i_step)
+                    self.neptune_run['val/support_post_adapt_acc'].log(accuracy_post_adapt_support.item(),step=i_step)
+                    self.neptune_run['val/query_post_adapt_acc'].log(accuracy_post_adapt_query.item(),step=i_step)
+
 
             if i_step % SAVE_INTERVAL == 0:
                 self._save(i_step)
@@ -353,6 +346,10 @@ class MAML:
             f'mean {mean:.3f}, '
             f'95% confidence interval {mean_95_confidence_interval:.3f}'
         )
+        if self.neptune_run:
+            self.neptune_run['test_acc_mean'].log(mean.item())
+            self.neptune_run['test_acc_std'].log(std.item())
+            self.neptune_run['test_acc_95_conf_int'].log(mean_95_confidence_interval.item())
 
     def load(self, checkpoint_step):
         """Loads a checkpoint.
@@ -400,7 +397,15 @@ def main(args):
     if log_dir is None:
         log_dir = f'./logs/maml/omniglot.way:{args.num_way}.support:{args.num_support}.query:{args.num_query}.inner_steps:{args.num_inner_steps}.inner_lr:{args.inner_lr}.learn_inner_lrs:{args.learn_inner_lrs}.outer_lr:{args.outer_lr}.batch_size:{args.batch_size}'  # pylint: disable=line-too-long
     print(f'log_dir: {log_dir}')
-    writer = tensorboard.SummaryWriter(log_dir=log_dir)
+
+    writer = None
+    neptune_run = None
+    if args.tensorboard:
+        writer = tensorboard.SummaryWriter(log_dir=log_dir)
+    
+    if args.neptune:
+        api_token = ''
+        neptune_run = neptune.init(project='kareem-elsawah/meta-learning', api_token=api_token, source_files=["*.py"])
 
     maml = MAML(
         args.num_way,
@@ -408,7 +413,9 @@ def main(args):
         args.inner_lr,
         args.learn_inner_lrs,
         args.outer_lr,
-        log_dir
+        log_dir,
+        writer,
+        neptune_run
     )
 
     if args.checkpoint_step > -1:
@@ -443,9 +450,17 @@ def main(args):
         )
         maml.train(
             dataloader_train,
-            dataloader_val,
-            writer
+            dataloader_val
         )
+        dataloader_test = omniglot.get_omniglot_dataloader(
+            'test',
+            1,
+            args.num_way,
+            args.num_support,
+            args.num_query,
+            NUM_TEST_TASKS
+        )
+        maml.test(dataloader_test)
     else:
         print(
             f'Testing on tasks with composition '
@@ -487,10 +502,14 @@ if __name__ == '__main__':
     parser.add_argument('--num_train_iterations', type=int, default=15000,
                         help='number of outer-loop updates to train for')
     parser.add_argument('--test', default=False, action='store_true',
-                        help='train or test')
+                        help='train-and-test or only-test')
     parser.add_argument('--checkpoint_step', type=int, default=-1,
                         help=('checkpoint iteration to load for resuming '
                               'training, or for evaluation (-1 is ignored)'))
+    parser.add_argument('--tensorboard', default=False, action='store_true',
+                        help='Log using Tensorboard')
+    parser.add_argument('--neptune', default=False, action='store_true',
+                        help='Log using Neptune (be sure to add api_token in main function first)')
 
     main_args = parser.parse_args()
     main(main_args)
