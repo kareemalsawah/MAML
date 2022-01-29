@@ -8,7 +8,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch import autograd  # pylint: disable=unused-import
-#from torch.utils import tensorboard
+from torch.utils import tensorboard
 
 import omniglot
 import util  # pylint: disable=unused-import
@@ -176,14 +176,15 @@ class MAML:
             k: torch.clone(v)
             for k, v in self._meta_parameters.items()
         }
+
         for _ in range(self._num_inner_steps):
             pred = self._forward(images, parameters)
             loss = F.cross_entropy(pred,labels)
             accuracies.append(util.score(pred.detach(),labels))
-
-            for k,v in parameters.items():
-                grad = torch.autograd.grad(loss, v, create_graph=True)[0]
-                parameters[k] = v - self._inner_lrs[k]*grad
+            params_list = [v for k,v in parameters.items()]
+            grads = torch.autograd.grad(loss, params_list, create_graph=True)
+            for idx,(k,v) in enumerate(parameters.items()):
+                parameters[k] = v - self._inner_lrs[k]*grads[idx]
 
         pred = self._forward(images, parameters)
         accuracies.append(util.score(pred.detach(),labels))
@@ -499,7 +500,7 @@ if __name__ == '__main__':
                         help='outer-loop learning rate')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='number of tasks per outer-loop update')
-    parser.add_argument('--num_train_iterations', type=int, default=15000,
+    parser.add_argument('--num_train_iterations', type=int, default=3000,
                         help='number of outer-loop updates to train for')
     parser.add_argument('--test', default=False, action='store_true',
                         help='train-and-test or only-test')
